@@ -1,4 +1,4 @@
-module gitlab.com/regsolutions/caddy-cache-purge
+module github.com/Hesusmordino/caddy-ssl-purge
 
 go 1.25.6
 
