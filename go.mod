@@ -1,6 +1,6 @@
 module gitlab.com/regsolutions/caddy-cache-purge
 
-go 1.25.6
+go 1.21.5
 
 require (
 	github.com/caddyserver/caddy/v2 v2.10.2
