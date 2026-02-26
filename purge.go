@@ -14,6 +14,7 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"time"
 )
 
 func init() {
@@ -25,6 +26,7 @@ var caddyCertCache *certmagic.Cache
 
 type RedisCertPurge struct {
 	Address  string `json:"address,omitempty"`
+	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	DB       int    `json:"db,omitempty"`
 	Channel  string `json:"channel,omitempty"`
@@ -44,22 +46,25 @@ func (RedisCertPurge) CaddyModule() caddy.ModuleInfo {
 }
 
 func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
-	p.logger = ctx.Logger()
+    p.logger = ctx.Logger()
 
-	if p.Address == "" {
-		p.Address = "localhost:6379"
-	}
-	if p.Channel == "" {
-		p.Channel = "caddy:cert:purge"
-	}
+    if p.Address == "" {
+        p.Address = "localhost:6379"
+    }
+    if p.Channel == "" {
+        p.Channel = "caddy:cert:purge"
+    }
 
-	p.client = redis.NewClient(&redis.Options{
-		Addr:     p.Address,
-		Password: p.Password,
-		DB:       p.DB,
-	})
+    p.client = redis.NewClient(&redis.Options{
+        Addr:     p.Address,
+        Username: p.Username,
+        Password: p.Password,
+        DB:       p.DB,
+    })
 
-	return nil
+    caddyCertCache = certmagic.Default.Cache
+
+    return nil
 }
 
 func (p *RedisCertPurge) Validate() error {
@@ -102,38 +107,102 @@ type PurgeMessage struct {
 func (p *RedisCertPurge) subscribeLoop() {
 	defer p.wg.Done()
 
-	pubsub := p.client.Subscribe(p.ctx, p.Channel)
-	defer pubsub.Close()
-
-	ch := pubsub.Channel()
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
 
 	for {
 		select {
 		case <-p.ctx.Done():
+			p.logger.Info("redis subscriber stopped")
 			return
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
-
-			var req PurgeMessage
-			if err := json.Unmarshal([]byte(msg.Payload), &req); err != nil {
-				p.logger.Error("failed to parse purge message",
-					zap.Error(err),
-					zap.String("payload", msg.Payload))
-				continue
-			}
-
-			if req.Domain == "" {
-				p.logger.Warn("received purge message with empty domain")
-				continue
-			}
-
-			p.purgeDomain(req.Domain)
-			p.logger.Info("purged certificate from cache",
-				zap.String("domain", req.Domain))
+		default:
 		}
+
+		p.logger.Info("connecting to redis for subscribe",
+			zap.String("address", p.Address),
+			zap.String("channel", p.Channel),
+		)
+
+		pubsub := p.client.Subscribe(p.ctx, p.Channel)
+
+		if _, err := pubsub.Receive(p.ctx); err != nil {
+			p.logger.Error("redis subscribe failed", zap.Error(err))
+
+			pubsub.Close()
+			p.sleepWithContext(backoff)
+
+			backoff = p.nextBackoff(backoff, maxBackoff)
+			continue
+		}
+
+		p.logger.Info("redis subscribed",
+			zap.String("channel", p.Channel),
+		)
+
+		backoff = time.Second
+
+		ch := pubsub.Channel()
+
+	loop:
+		for {
+			select {
+			case <-p.ctx.Done():
+				pubsub.Close()
+				return
+
+			case msg, ok := <-ch:
+				if !ok {
+					p.logger.Warn("redis channel closed, reconnecting")
+					break loop
+				}
+
+				p.handleMessage(msg.Payload)
+			}
+		}
+
+		pubsub.Close()
+		p.sleepWithContext(backoff)
+		backoff = p.nextBackoff(backoff, maxBackoff)
 	}
+}
+
+func (p *RedisCertPurge) sleepWithContext(d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-p.ctx.Done():
+	case <-t.C:
+	}
+}
+
+func (p *RedisCertPurge) nextBackoff(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
+func (p *RedisCertPurge) handleMessage(payload string) {
+	var req PurgeMessage
+
+	if err := json.Unmarshal([]byte(payload), &req); err != nil {
+		p.logger.Error("failed to parse purge message",
+			zap.Error(err),
+			zap.String("payload", payload))
+		return
+	}
+
+	if req.Domain == "" {
+		p.logger.Warn("received purge message with empty domain")
+		return
+	}
+
+	p.purgeDomain(req.Domain)
+
+	p.logger.Info("purged certificate from cache",
+		zap.String("domain", req.Domain))
 }
 
 func (p *RedisCertPurge) purgeDomain(domain string) {
@@ -159,6 +228,12 @@ func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, er
 					return nil, d.ArgErr()
 				}
 				p.Password = d.Val()
+
+			case "username":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				p.Username = d.Val()	
 
 			case "db":
 				if !d.NextArg() {
