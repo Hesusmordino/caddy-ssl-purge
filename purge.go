@@ -206,9 +206,21 @@ func (p *RedisCertPurge) handleMessage(payload string) {
 }
 
 func (p *RedisCertPurge) purgeDomain(domain string) {
-	caddyCertCache.RemoveManaged([]certmagic.SubjectIssuer{
-		{Subject: domain},
-	})
+    cfg := certmagic.GetConfigForName(domain)
+
+    if cfg == nil {
+        p.logger.Warn("no certmagic config for domain", zap.String("domain", domain))
+        return
+    }
+
+    if cfg.Cache == nil {
+        p.logger.Warn("certmagic cache nil", zap.String("domain", domain))
+        return
+    }
+
+    cfg.Cache.RemoveManaged([]certmagic.SubjectIssuer{
+        {Subject: domain},
+    })
 }
 
 func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
