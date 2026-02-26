@@ -60,7 +60,7 @@ func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
 	})
 
 	// Fail-fast если Redis недоступен
-	if err := p.client.Ping(ctx.Context).Err(); err != nil {
+	if err := p.client.Ping(context.Background()).Err(); err != nil {
 		return err
 	}
 
@@ -202,25 +202,25 @@ func (p *RedisCertPurge) handleMessage(payload string) {
 }
 
 func (p *RedisCertPurge) purgeDomain(domain string) {
-	cfg := certmagic.GetConfigForName(domain)
-	if cfg == nil {
-		p.logger.Warn("no certmagic config for domain",
-			zap.String("domain", domain))
+	cfg := certmagic.Default
+	if cfg.Storage == nil {
+		p.logger.Warn("certmagic storage is nil", zap.String("domain", domain))
 		return
 	}
 
-	if cfg.Cache == nil {
-		p.logger.Warn("certmagic cache is nil",
-			zap.String("domain", domain))
-		return
+	keys := []string{
+		certmagic.StorageKeyForCertificate(domain),
+		certmagic.StorageKeyForPrivateKey(domain),
+		certmagic.StorageKeyForMeta(domain),
 	}
 
-	cfg.Cache.RemoveManaged([]certmagic.SubjectIssuer{
-		{Subject: domain},
-	})
+	for _, key := range keys {
+		if err := cfg.Storage.Delete(context.Background(), key); err != nil {
+			p.logger.Error("failed to delete key from storage", zap.String("key", key), zap.Error(err))
+		}
+	}
 
-	p.logger.Info("purged certificate from cache",
-		zap.String("domain", domain))
+	p.logger.Info("purged certificate from storage", zap.String("domain", domain))
 }
 
 func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
