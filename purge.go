@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"sync"
-	_ "unsafe"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -14,15 +14,12 @@ import (
 	"github.com/caddyserver/certmagic"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
-	"time"
 )
 
 func init() {
 	caddy.RegisterModule(RedisCertPurge{})
 	httpcaddyfile.RegisterGlobalOption("redis_cert_purge", parseRedisCertPurge)
 }
-
-var caddyCertCache *certmagic.Cache
 
 type RedisCertPurge struct {
 	Address  string `json:"address,omitempty"`
@@ -46,25 +43,28 @@ func (RedisCertPurge) CaddyModule() caddy.ModuleInfo {
 }
 
 func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
-    p.logger = ctx.Logger()
+	p.logger = ctx.Logger()
 
-    if p.Address == "" {
-        p.Address = "localhost:6379"
-    }
-    if p.Channel == "" {
-        p.Channel = "caddy:cert:purge"
-    }
+	if p.Address == "" {
+		p.Address = "localhost:6379"
+	}
+	if p.Channel == "" {
+		p.Channel = "caddy:cert:purge"
+	}
 
-    p.client = redis.NewClient(&redis.Options{
-        Addr:     p.Address,
-        Username: p.Username,
-        Password: p.Password,
-        DB:       p.DB,
-    })
+	p.client = redis.NewClient(&redis.Options{
+		Addr:     p.Address,
+		Username: p.Username,
+		Password: p.Password,
+		DB:       p.DB,
+	})
 
-    caddyCertCache = certmagic.Default.Cache
+	// Fail-fast если Redis недоступен
+	if err := p.client.Ping(ctx.Context).Err(); err != nil {
+		return err
+	}
 
-    return nil
+	return nil
 }
 
 func (p *RedisCertPurge) Validate() error {
@@ -79,7 +79,9 @@ func (p *RedisCertPurge) Start() error {
 
 	p.logger.Info("redis cert purge started",
 		zap.String("address", p.Address),
-		zap.String("channel", p.Channel))
+		zap.String("channel", p.Channel),
+		zap.String("username", p.Username),
+	)
 
 	return nil
 }
@@ -125,12 +127,11 @@ func (p *RedisCertPurge) subscribeLoop() {
 
 		pubsub := p.client.Subscribe(p.ctx, p.Channel)
 
+		// handshake
 		if _, err := pubsub.Receive(p.ctx); err != nil {
 			p.logger.Error("redis subscribe failed", zap.Error(err))
-
 			pubsub.Close()
 			p.sleepWithContext(backoff)
-
 			backoff = p.nextBackoff(backoff, maxBackoff)
 			continue
 		}
@@ -140,7 +141,6 @@ func (p *RedisCertPurge) subscribeLoop() {
 		)
 
 		backoff = time.Second
-
 		ch := pubsub.Channel()
 
 	loop:
@@ -155,7 +155,6 @@ func (p *RedisCertPurge) subscribeLoop() {
 					p.logger.Warn("redis channel closed, reconnecting")
 					break loop
 				}
-
 				p.handleMessage(msg.Payload)
 			}
 		}
@@ -200,27 +199,28 @@ func (p *RedisCertPurge) handleMessage(payload string) {
 	}
 
 	p.purgeDomain(req.Domain)
-
-	p.logger.Info("purged certificate from cache",
-		zap.String("domain", req.Domain))
 }
 
 func (p *RedisCertPurge) purgeDomain(domain string) {
-    cfg := certmagic.GetConfigForName(domain)
+	cfg := certmagic.GetConfigForName(domain)
+	if cfg == nil {
+		p.logger.Warn("no certmagic config for domain",
+			zap.String("domain", domain))
+		return
+	}
 
-    if cfg == nil {
-        p.logger.Warn("no certmagic config for domain", zap.String("domain", domain))
-        return
-    }
+	if cfg.Cache == nil {
+		p.logger.Warn("certmagic cache is nil",
+			zap.String("domain", domain))
+		return
+	}
 
-    if cfg.Cache == nil {
-        p.logger.Warn("certmagic cache nil", zap.String("domain", domain))
-        return
-    }
+	cfg.Cache.RemoveManaged([]certmagic.SubjectIssuer{
+		{Subject: domain},
+	})
 
-    cfg.Cache.RemoveManaged([]certmagic.SubjectIssuer{
-        {Subject: domain},
-    })
+	p.logger.Info("purged certificate from cache",
+		zap.String("domain", domain))
 }
 
 func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
@@ -229,23 +229,24 @@ func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, er
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
+
 			case "address":
 				if !d.NextArg() {
 					return nil, d.ArgErr()
 				}
 				p.Address = d.Val()
 
+			case "username":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				p.Username = d.Val()
+
 			case "password":
 				if !d.NextArg() {
 					return nil, d.ArgErr()
 				}
 				p.Password = d.Val()
-
-			case "username":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				p.Username = d.Val()	
 
 			case "db":
 				if !d.NextArg() {
