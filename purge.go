@@ -1,285 +1,307 @@
-package caddycachepurge
+	package caddycachepurge
 
-import (
-	"context"
-	"encoding/json"
-	"strconv"
-	"sync"
-	"time"
+	import (
+		"context"
+		"encoding/json"
+		"strconv"
+		"sync"
+		"time"
+		"strings"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/certmagic"
-	"github.com/redis/go-redis/v9"
-	"go.uber.org/zap"
-)
-
-func init() {
-	caddy.RegisterModule(RedisCertPurge{})
-	httpcaddyfile.RegisterGlobalOption("redis_cert_purge", parseRedisCertPurge)
-}
-
-type RedisCertPurge struct {
-	Address  string `json:"address,omitempty"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	DB       int    `json:"db,omitempty"`
-	Channel  string `json:"channel,omitempty"`
-
-	logger *zap.Logger
-	client *redis.Client
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-}
-
-func (RedisCertPurge) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "redis_cert_purge",
-		New: func() caddy.Module { return new(RedisCertPurge) },
-	}
-}
-
-func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
-	p.logger = ctx.Logger()
-
-	if p.Address == "" {
-		p.Address = "localhost:6379"
-	}
-	if p.Channel == "" {
-		p.Channel = "caddy:cert:purge"
-	}
-
-	p.client = redis.NewClient(&redis.Options{
-		Addr:     p.Address,
-		Username: p.Username,
-		Password: p.Password,
-		DB:       p.DB,
-	})
-
-	// Fail-fast если Redis недоступен
-	if err := p.client.Ping(context.Background()).Err(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (p *RedisCertPurge) Validate() error {
-	return nil
-}
-
-func (p *RedisCertPurge) Start() error {
-	p.ctx, p.cancel = context.WithCancel(context.Background())
-
-	p.wg.Add(1)
-	go p.subscribeLoop()
-
-	p.logger.Info("redis cert purge started",
-		zap.String("address", p.Address),
-		zap.String("channel", p.Channel),
-		zap.String("username", p.Username),
+		"github.com/caddyserver/caddy/v2"
+		"github.com/caddyserver/caddy/v2/caddyconfig"
+		"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+		"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+		"github.com/caddyserver/certmagic"
+		"github.com/redis/go-redis/v9"
+		"go.uber.org/zap"
 	)
 
-	return nil
-}
-
-func (p *RedisCertPurge) Stop() error {
-	if p.cancel != nil {
-		p.cancel()
+	func init() {
+		caddy.RegisterModule(RedisCertPurge{})
+		httpcaddyfile.RegisterGlobalOption("redis_cert_purge", parseRedisCertPurge)
 	}
-	p.wg.Wait()
 
-	if p.client != nil {
-		return p.client.Close()
+	type RedisCertPurge struct {
+		Address  string `json:"address,omitempty"`
+		Username string `json:"username,omitempty"`
+		Password string `json:"password,omitempty"`
+		DB       int    `json:"db,omitempty"`
+		Channel  string `json:"channel,omitempty"`
+
+		logger *zap.Logger
+		client *redis.Client
+		ctx    context.Context
+		cancel context.CancelFunc
+		wg     sync.WaitGroup
 	}
-	return nil
-}
 
-func (p *RedisCertPurge) Cleanup() error {
-	return p.Stop()
-}
+	func (RedisCertPurge) CaddyModule() caddy.ModuleInfo {
+		return caddy.ModuleInfo{
+			ID:  "redis_cert_purge",
+			New: func() caddy.Module { return new(RedisCertPurge) },
+		}
+	}
 
-type PurgeMessage struct {
-	Domain string `json:"domain"`
-}
+	func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
+		p.logger = ctx.Logger()
 
-func (p *RedisCertPurge) subscribeLoop() {
-	defer p.wg.Done()
-
-	backoff := time.Second
-	maxBackoff := 30 * time.Second
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			p.logger.Info("redis subscriber stopped")
-			return
-		default:
+		if p.Address == "" {
+			p.Address = "localhost:6379"
+		}
+		if p.Channel == "" {
+			p.Channel = "caddy:cert:purge"
 		}
 
-		p.logger.Info("connecting to redis for subscribe",
+		p.client = redis.NewClient(&redis.Options{
+			Addr:     p.Address,
+			Username: p.Username,
+			Password: p.Password,
+			DB:       p.DB,
+		})
+
+		// Fail-fast если Redis недоступен
+		if err := p.client.Ping(context.Background()).Err(); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	func (p *RedisCertPurge) Validate() error {
+		return nil
+	}
+
+	func (p *RedisCertPurge) Start() error {
+		p.ctx, p.cancel = context.WithCancel(context.Background())
+
+		p.wg.Add(1)
+		go p.subscribeLoop()
+
+		p.logger.Info("redis cert purge started",
 			zap.String("address", p.Address),
 			zap.String("channel", p.Channel),
+			zap.String("username", p.Username),
 		)
 
-		pubsub := p.client.Subscribe(p.ctx, p.Channel)
+		return nil
+	}
 
-		// handshake
-		if _, err := pubsub.Receive(p.ctx); err != nil {
-			p.logger.Error("redis subscribe failed", zap.Error(err))
-			pubsub.Close()
-			p.sleepWithContext(backoff)
-			backoff = p.nextBackoff(backoff, maxBackoff)
-			continue
+	func (p *RedisCertPurge) Stop() error {
+		if p.cancel != nil {
+			p.cancel()
 		}
+		p.wg.Wait()
 
-		p.logger.Info("redis subscribed",
-			zap.String("channel", p.Channel),
-		)
+		if p.client != nil {
+			return p.client.Close()
+		}
+		return nil
+	}
 
-		backoff = time.Second
-		ch := pubsub.Channel()
+	func (p *RedisCertPurge) Cleanup() error {
+		return p.Stop()
+	}
 
-	loop:
+	type PurgeMessage struct {
+		Domain string `json:"domain"`
+	}
+
+	func (p *RedisCertPurge) subscribeLoop() {
+		defer p.wg.Done()
+
+		backoff := time.Second
+		maxBackoff := 30 * time.Second
+
 		for {
 			select {
 			case <-p.ctx.Done():
-				pubsub.Close()
+				p.logger.Info("redis subscriber stopped")
 				return
-
-			case msg, ok := <-ch:
-				if !ok {
-					p.logger.Warn("redis channel closed, reconnecting")
-					break loop
-				}
-				p.handleMessage(msg.Payload)
+			default:
 			}
+
+			p.logger.Info("connecting to redis for subscribe",
+				zap.String("address", p.Address),
+				zap.String("channel", p.Channel),
+			)
+
+			pubsub := p.client.Subscribe(p.ctx, p.Channel)
+
+			// handshake
+			if _, err := pubsub.Receive(p.ctx); err != nil {
+				p.logger.Error("redis subscribe failed", zap.Error(err))
+				pubsub.Close()
+				p.sleepWithContext(backoff)
+				backoff = p.nextBackoff(backoff, maxBackoff)
+				continue
+			}
+
+			p.logger.Info("redis subscribed",
+				zap.String("channel", p.Channel),
+			)
+
+			backoff = time.Second
+			ch := pubsub.Channel()
+
+		loop:
+			for {
+				select {
+				case <-p.ctx.Done():
+					pubsub.Close()
+					return
+
+				case msg, ok := <-ch:
+					if !ok {
+						p.logger.Warn("redis channel closed, reconnecting")
+						break loop
+					}
+					p.handleMessage(msg.Payload)
+				}
+			}
+
+			pubsub.Close()
+			p.sleepWithContext(backoff)
+			backoff = p.nextBackoff(backoff, maxBackoff)
+		}
+	}
+
+	func (p *RedisCertPurge) sleepWithContext(d time.Duration) {
+		t := time.NewTimer(d)
+		defer t.Stop()
+
+		select {
+		case <-p.ctx.Done():
+		case <-t.C:
+		}
+	}
+
+	func (p *RedisCertPurge) nextBackoff(current, max time.Duration) time.Duration {
+		next := current * 2
+		if next > max {
+			return max
+		}
+		return next
+	}
+
+	func (p *RedisCertPurge) handleMessage(payload string) {
+		var req PurgeMessage
+
+		if err := json.Unmarshal([]byte(payload), &req); err != nil {
+			p.logger.Error("failed to parse purge message",
+				zap.Error(err),
+				zap.String("payload", payload))
+			return
 		}
 
-		pubsub.Close()
-		p.sleepWithContext(backoff)
-		backoff = p.nextBackoff(backoff, maxBackoff)
-	}
-}
+		if req.Domain == "" {
+			p.logger.Warn("received purge message with empty domain")
+			return
+		}
 
-func (p *RedisCertPurge) sleepWithContext(d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-
-	select {
-	case <-p.ctx.Done():
-	case <-t.C:
-	}
-}
-
-func (p *RedisCertPurge) nextBackoff(current, max time.Duration) time.Duration {
-	next := current * 2
-	if next > max {
-		return max
-	}
-	return next
-}
-
-func (p *RedisCertPurge) handleMessage(payload string) {
-	var req PurgeMessage
-
-	if err := json.Unmarshal([]byte(payload), &req); err != nil {
-		p.logger.Error("failed to parse purge message",
-			zap.Error(err),
-			zap.String("payload", payload))
-		return
+		p.purgeDomain(req.Domain)
 	}
 
-	if req.Domain == "" {
-		p.logger.Warn("received purge message with empty domain")
-		return
-	}
-
-	p.purgeDomain(req.Domain)
-}
-
-func (p *RedisCertPurge) purgeDomain(domain string) {
+	func (p *RedisCertPurge) purgeDomain(domain string) {
 	cfg := certmagic.Default
 	if cfg.Storage == nil {
 		p.logger.Warn("certmagic storage is nil", zap.String("domain", domain))
 		return
 	}
 
-	keys := []string{
-		certmagic.StorageKeyForCertificate(domain),
-		certmagic.StorageKeyForPrivateKey(domain),
-		certmagic.StorageKeyForMeta(domain),
+	ctx := context.Background()
+
+	prefix := "certificates"
+
+	keys, err := cfg.Storage.List(ctx, prefix, true)
+	if err != nil {
+		p.logger.Error("failed to list storage keys", zap.Error(err))
+		return
 	}
 
-	for _, key := range keys {
-		if err := cfg.Storage.Delete(context.Background(), key); err != nil {
-			p.logger.Error("failed to delete key from storage", zap.String("key", key), zap.Error(err))
+	var deleted int
+
+	for _, k := range keys {
+		// быстрый contains — достаточно
+		if !containsDomain(k, domain) {
+			continue
 		}
+
+		if err := cfg.Storage.Delete(ctx, k); err != nil {
+			p.logger.Error("failed to delete key",
+				zap.String("key", k),
+				zap.Error(err))
+			continue
+		}
+
+		deleted++
 	}
 
-	p.logger.Info("purged certificate from storage", zap.String("domain", domain))
+	p.logger.Info("purged certificate from storage",
+		zap.String("domain", domain),
+		zap.Int("deleted_keys", deleted))
 }
 
-func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
-	var p RedisCertPurge
+func containsDomain(key, domain string) bool {
+	return strings.Contains(key, "/"+domain+"/")
+}
+	func parseRedisCertPurge(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+		var p RedisCertPurge
 
-	for d.Next() {
-		for d.NextBlock(0) {
-			switch d.Val() {
+		for d.Next() {
+			for d.NextBlock(0) {
+				switch d.Val() {
 
-			case "address":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
+				case "address":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					p.Address = d.Val()
+
+				case "username":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					p.Username = d.Val()
+
+				case "password":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					p.Password = d.Val()
+
+				case "db":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					db, err := strconv.Atoi(d.Val())
+					if err != nil {
+						return nil, d.Errf("invalid db number: %v", err)
+					}
+					p.DB = db
+
+				case "channel":
+					if !d.NextArg() {
+						return nil, d.ArgErr()
+					}
+					p.Channel = d.Val()
+
+				default:
+					return nil, d.Errf("unknown subdirective: %s", d.Val())
 				}
-				p.Address = d.Val()
-
-			case "username":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				p.Username = d.Val()
-
-			case "password":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				p.Password = d.Val()
-
-			case "db":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				db, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return nil, d.Errf("invalid db number: %v", err)
-				}
-				p.DB = db
-
-			case "channel":
-				if !d.NextArg() {
-					return nil, d.ArgErr()
-				}
-				p.Channel = d.Val()
-
-			default:
-				return nil, d.Errf("unknown subdirective: %s", d.Val())
 			}
 		}
+
+		return httpcaddyfile.App{
+			Name:  "redis_cert_purge",
+			Value: caddyconfig.JSON(p, nil),
+		}, nil
 	}
 
-	return httpcaddyfile.App{
-		Name:  "redis_cert_purge",
-		Value: caddyconfig.JSON(p, nil),
-	}, nil
-}
-
-var (
-	_ caddy.Module       = (*RedisCertPurge)(nil)
-	_ caddy.Provisioner  = (*RedisCertPurge)(nil)
-	_ caddy.Validator    = (*RedisCertPurge)(nil)
-	_ caddy.App          = (*RedisCertPurge)(nil)
-	_ caddy.CleanerUpper = (*RedisCertPurge)(nil)
-)
+	var (
+		_ caddy.Module       = (*RedisCertPurge)(nil)
+		_ caddy.Provisioner  = (*RedisCertPurge)(nil)
+		_ caddy.Validator    = (*RedisCertPurge)(nil)
+		_ caddy.App          = (*RedisCertPurge)(nil)
+		_ caddy.CleanerUpper = (*RedisCertPurge)(nil)
+	)
