@@ -3,16 +3,17 @@ package caddycachepurge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
-	_ "unsafe"
+	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	_ "github.com/caddyserver/caddy/v2/modules/caddytls"
 	"github.com/caddyserver/certmagic"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -30,11 +31,12 @@ type RedisCertPurge struct {
 	DB       int    `json:"db,omitempty"`
 	Channel  string `json:"channel,omitempty"`
 
-	logger *zap.Logger
-	client *redis.Client
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	logger    *zap.Logger
+	client    *redis.Client
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	certCache *certmagic.Cache
 }
 
 func (RedisCertPurge) CaddyModule() caddy.ModuleInfo {
@@ -65,7 +67,73 @@ func (p *RedisCertPurge) Provision(ctx caddy.Context) error {
 		return err
 	}
 
+	tlsAppIface, err := ctx.App("tls")
+	if err != nil {
+		return fmt.Errorf("failed to get tls app: %v", err)
+	}
+
+	p.certCache = extractCertCache(tlsAppIface)
+	if p.certCache == nil {
+		p.logger.Warn("could not extract cert cache from tls app")
+	}
+
 	return nil
+}
+
+func extractCertCache(tlsApp interface{}) *certmagic.Cache {
+	tlsVal := reflect.ValueOf(tlsApp)
+	if tlsVal.Kind() == reflect.Ptr {
+		tlsVal = tlsVal.Elem()
+	}
+
+	automationField := tlsVal.FieldByName("Automation")
+	if !automationField.IsValid() || automationField.IsNil() {
+		return nil
+	}
+
+	return extractCacheFromPolicy(automationField.Elem())
+}
+
+func extractCacheFromPolicy(automationVal reflect.Value) *certmagic.Cache {
+	for _, fieldName := range []string{"defaultPublicAutomationPolicy", "defaultInternalAutomationPolicy"} {
+		policyField := automationVal.FieldByName(fieldName)
+		if !policyField.IsValid() || policyField.IsNil() {
+			continue
+		}
+		if cache := extractCacheFromMagic(policyField.Elem()); cache != nil {
+			return cache
+		}
+	}
+
+	policiesField := automationVal.FieldByName("Policies")
+	if policiesField.IsValid() {
+		for i := 0; i < policiesField.Len(); i++ {
+			policy := policiesField.Index(i)
+			if policy.Kind() == reflect.Ptr {
+				policy = policy.Elem()
+			}
+			if cache := extractCacheFromMagic(policy); cache != nil {
+				return cache
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractCacheFromMagic(policyVal reflect.Value) *certmagic.Cache {
+	magicField := policyVal.FieldByName("magic")
+	if !magicField.IsValid() || magicField.IsNil() {
+		return nil
+	}
+
+	magicVal := magicField.Elem()
+	cacheField := magicVal.FieldByName("certCache")
+	if !cacheField.IsValid() || cacheField.IsNil() {
+		return nil
+	}
+
+	return (*certmagic.Cache)(unsafe.Pointer(cacheField.Pointer()))
 }
 
 func (p *RedisCertPurge) Validate() error {
@@ -201,21 +269,13 @@ func (p *RedisCertPurge) handleMessage(payload string) {
 	p.purgeDomain(req.Domain)
 }
 
-var caddyTLSCertCache *certmagic.Cache
-
-var caddyTLSCertCacheMu sync.RWMutex
-
 func (p *RedisCertPurge) purgeDomain(domain string) {
-	caddyTLSCertCacheMu.RLock()
-	cache := caddyTLSCertCache
-	caddyTLSCertCacheMu.RUnlock()
-
-	if cache == nil {
+	if p.certCache == nil {
 		p.logger.Warn("cert cache not initialized", zap.String("domain", domain))
 		return
 	}
 
-	cache.RemoveManaged([]certmagic.SubjectIssuer{
+	p.certCache.RemoveManaged([]certmagic.SubjectIssuer{
 		{Subject: domain},
 	})
 
